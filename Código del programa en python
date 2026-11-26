@@ -1,0 +1,607 @@
+"""PURGE UNINSTALLER V1.1 - Deep Cleaner
+
+Windows only. Dependencies:
+    py -m pip install customtkinter send2trash
+
+Run:
+    py purge_uninstaller.py
+
+Safety model:
+- Scans only common application folders and selected Software registry branches.
+- Shows every candidate for manual review; nothing is deleted automatically.
+- Files/folders are moved to the Recycle Bin using send2trash.
+- Registry keys are exported to a .reg backup before deletion.
+- Does not scan/delete Windows system folders or shared runtime components.
+"""
+
+import ctypes
+import os
+import re
+import subprocess
+import sys
+import threading
+import winreg
+from datetime import datetime
+from pathlib import Path
+from tkinter import messagebox
+
+try:
+    import customtkinter as ctk
+except ImportError:
+    raise SystemExit("Falta CustomTkinter. Instala con: py -m pip install customtkinter send2trash")
+
+try:
+    from send2trash import send2trash
+except ImportError:
+    raise SystemExit("Falta send2trash. Instala con: py -m pip install customtkinter send2trash")
+
+APP_NAME = "PURGE UNINSTALLER"
+APP_VERSION = "1.1"
+UNINSTALL_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+SOFTWARE_KEY = r"SOFTWARE"
+BACKUP_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "PurgeUninstaller" / "RegistryBackups"
+
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
+
+
+def expand_windows_environment(value):
+    if not value:
+        return ""
+    try:
+        needed = ctypes.windll.kernel32.ExpandEnvironmentStringsW(value, None, 0)
+        if needed:
+            buffer = ctypes.create_unicode_buffer(needed)
+            ctypes.windll.kernel32.ExpandEnvironmentStringsW(value, buffer, needed)
+            return buffer.value
+    except Exception:
+        pass
+    return os.path.expandvars(value)
+
+
+def split_windows_command(command):
+    command = expand_windows_environment(command.strip())
+    if not command:
+        return []
+    shell32 = ctypes.windll.shell32
+    kernel32 = ctypes.windll.kernel32
+    shell32.CommandLineToArgvW.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_int)]
+    shell32.CommandLineToArgvW.restype = ctypes.POINTER(ctypes.c_wchar_p)
+    argc = ctypes.c_int()
+    argv = shell32.CommandLineToArgvW(command, ctypes.byref(argc))
+    if not argv:
+        raise ctypes.WinError()
+    try:
+        return [argv[i] for i in range(argc.value)]
+    finally:
+        kernel32.LocalFree(argv)
+
+
+def read_registry_value(key, name, default=""):
+    try:
+        value, _ = winreg.QueryValueEx(key, name)
+        return value if value is not None else default
+    except OSError:
+        return default
+
+
+def registry_views():
+    if hasattr(winreg, "KEY_WOW64_64KEY"):
+        return [winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY]
+    return [0]
+
+
+def get_installed_programs():
+    programs, seen = [], set()
+    roots = [(winreg.HKEY_LOCAL_MACHINE, "Equipo"), (winreg.HKEY_CURRENT_USER, "Usuario actual")]
+    for root, scope in roots:
+        for view in registry_views():
+            try:
+                with winreg.OpenKey(root, UNINSTALL_KEY, 0, winreg.KEY_READ | view) as parent:
+                    count = winreg.QueryInfoKey(parent)[0]
+                    for i in range(count):
+                        try:
+                            subkey_name = winreg.EnumKey(parent, i)
+                            with winreg.OpenKey(parent, subkey_name) as key:
+                                name = read_registry_value(key, "DisplayName")
+                                if not isinstance(name, str) or not name.strip():
+                                    continue
+                                if str(read_registry_value(key, "SystemComponent", 0)) == "1":
+                                    continue
+                                release_type = str(read_registry_value(key, "ReleaseType", "")).lower()
+                                if release_type in {"hotfix", "update", "security update", "actualización"}:
+                                    continue
+                                publisher = read_registry_value(key, "Publisher")
+                                version = read_registry_value(key, "DisplayVersion")
+                                identity = (name.casefold().strip(), str(publisher).casefold(), str(version).casefold())
+                                if identity in seen:
+                                    continue
+                                seen.add(identity)
+                                programs.append({
+                                    "name": name.strip(),
+                                    "version": str(version or "No especificada"),
+                                    "publisher": str(publisher or "Desconocido"),
+                                    "location": str(read_registry_value(key, "InstallLocation") or "No especificada"),
+                                    "uninstall": str(read_registry_value(key, "UninstallString") or ""),
+                                    "install_date": str(read_registry_value(key, "InstallDate") or "No especificada"),
+                                    "scope": scope,
+                                    "registry_key": subkey_name,
+                                })
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+    return sorted(programs, key=lambda p: p["name"].casefold())
+
+
+def normalize_name(value):
+    value = str(value or "").casefold()
+    value = re.sub(r"\b( x64| x86| 32-bit| 64-bit|\d+(?:\.\d+){1,})\b", " ", value)
+    return re.sub(r"[^a-z0-9]+", "", value)
+
+
+def app_tokens(program):
+    # Keep only distinctive tokens; generic words are too likely to match unrelated items.
+    raw = re.findall(r"[a-z0-9]+", program["name"].casefold())
+    generic = {"the", "and", "for", "app", "application", "program", "setup", "x64", "x86", "32", "64"}
+    return [t for t in raw if len(t) >= 4 and t not in generic]
+
+
+def path_size(path):
+    try:
+        if path.is_file():
+            return path.stat().st_size
+        total = 0
+        for root, dirs, files in os.walk(path, onerror=lambda _e: None):
+            dirs[:] = [d for d in dirs if d not in {"Windows", "System32", "WinSxS"}]
+            for filename in files:
+                try:
+                    total += (Path(root) / filename).stat().st_size
+                except OSError:
+                    pass
+        return total
+    except OSError:
+        return 0
+
+
+def format_size(size):
+    units = ["B", "KB", "MB", "GB"]
+    value = float(size)
+    for unit in units:
+        if value < 1024 or unit == "GB":
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GB"
+
+
+def common_scan_roots():
+    home = Path.home()
+    roots = []
+    for env in ("ProgramFiles", "ProgramFiles(x86)", "ProgramData", "APPDATA", "LOCALAPPDATA"):
+        value = os.environ.get(env)
+        if value:
+            roots.append(Path(value))
+    roots.extend([
+        home / "Desktop",
+        home / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Start Menu" / "Programs",
+        home / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Start Menu",
+    ])
+    unique = []
+    for root in roots:
+        try:
+            resolved = root.resolve()
+            if resolved.exists() and resolved not in unique:
+                unique.append(resolved)
+        except OSError:
+            continue
+    return unique
+
+
+def find_file_candidates(program):
+    """Conservative scan: direct child folders, plus matching shortcuts."""
+    candidates, seen = [], set()
+    name_norm = normalize_name(program["name"])
+    tokens = app_tokens(program)
+    install_location = expand_windows_environment(program.get("location", ""))
+    likely_dirs = []
+    if install_location and install_location != "No especificada":
+        p = Path(install_location.strip('"'))
+        try:
+            if p.exists() and p.is_dir():
+                base_norm = normalize_name(p.name)
+                looks_like_app = bool(name_norm and (
+                    name_norm == base_norm or
+                    (len(name_norm) >= 7 and name_norm in base_norm) or
+                    (len(tokens) >= 2 and all(token in base_norm for token in tokens[:2]))
+                ))
+                if looks_like_app:
+                    likely_dirs.append(p.resolve())
+        except OSError:
+            pass
+
+    for root in common_scan_roots():
+        # Walk at most three directory levels. Matching is based on the combined
+        # relative path, so vendor\application layouts can be detected without
+        # searching an entire drive.
+        try:
+            for current, dirs, files in os.walk(root, topdown=True, onerror=lambda _e: None):
+                current_path = Path(current)
+                try:
+                    depth = len(current_path.relative_to(root).parts)
+                except ValueError:
+                    dirs[:] = []
+                    continue
+                dirs[:] = [d for d in dirs if not (current_path / d).is_symlink()]
+                if depth >= 2:
+                    dirs[:] = []
+                relative_name = normalize_name(str(current_path.relative_to(root)))
+                matched_folder = bool(name_norm and (
+                    relative_name == name_norm or
+                    (len(name_norm) >= 7 and name_norm in relative_name)
+                ))
+                if not matched_folder and len(tokens) >= 2:
+                    matched_folder = all(token in relative_name for token in tokens[:2])
+                if current_path != root and matched_folder:
+                    likely_dirs.append(current_path)
+                    dirs[:] = []  # Do not list nested contents separately.
+                    continue
+                for filename in files:
+                    if filename.lower().endswith('.lnk'):
+                        shortcut = current_path / filename
+                        shortcut_name = normalize_name(shortcut.stem)
+                        if name_norm and (shortcut_name == name_norm or name_norm in shortcut_name):
+                            likely_dirs.append(shortcut)
+        except (OSError, PermissionError):
+            continue
+
+    for candidate in likely_dirs:
+        try:
+            resolved = candidate.resolve()
+            if resolved in seen or not resolved.exists():
+                continue
+            seen.add(resolved)
+            # Refuse dangerous roots and Windows/system locations.
+            text_path = str(resolved).casefold()
+            if any(part in text_path for part in ("\\windows\\", "\\system volume information", "\\programdata\\microsoft\\windows")):
+                continue
+            if resolved == Path(resolved.anchor):
+                continue
+            candidates.append({
+                "kind": "Carpeta" if resolved.is_dir() else "Acceso directo",
+                "path": str(resolved),
+                "size": path_size(resolved),
+                "registry": False,
+            })
+        except OSError:
+            continue
+    return candidates
+
+
+def registry_candidate_keys(program):
+    """Find app-name-like keys only under HKCU/HKLM Software; never bulk-delete."""
+    candidates = []
+    # Shared runtimes and system components are deliberately excluded.
+    sensitive_shared = ("redistributable", "runtime", "framework", "visual c++", ".net", "webview", "directx", "driver", "security update")
+    if any(term in program["name"].casefold() for term in sensitive_shared):
+        return candidates
+    target = normalize_name(program["name"])
+    tokens = app_tokens(program)
+    blocked = {"microsoft", "windows", "classes", "wow6432node", "policies", "clients", "odbc", "mozilla", "google"}
+    roots = [(winreg.HKEY_CURRENT_USER, "HKCU", SOFTWARE_KEY), (winreg.HKEY_LOCAL_MACHINE, "HKLM", SOFTWARE_KEY)]
+    for root, hive_name, base in roots:
+        for view in registry_views():
+            try:
+                with winreg.OpenKey(root, base, 0, winreg.KEY_READ | view) as key:
+                    count = winreg.QueryInfoKey(key)[0]
+                    for i in range(count):
+                        try:
+                            sub = winreg.EnumKey(key, i)
+                            norm = normalize_name(sub)
+                            if norm in blocked or len(norm) < 5:
+                                continue
+                            exactish = bool(target and (norm == target or (len(target) >= 7 and target in norm)))
+                            token_match = len(tokens) >= 2 and all(t in norm for t in tokens[:2])
+                            if exactish or token_match:
+                                candidates.append({
+                                    "kind": "Clave del Registro",
+                                    "path": f"{hive_name}\\{base}\\{sub}",
+                                    "size": 0,
+                                    "registry": True,
+                                    "hive": hive_name,
+                                    "subkey": f"{base}\\{sub}",
+                                    "view": view,
+                                })
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+    # Avoid duplicate key paths across 32/64-bit views in the UI.
+    unique, result = set(), []
+    for item in candidates:
+        ident = (item["hive"], item["subkey"].casefold())
+        if ident not in unique:
+            unique.add(ident)
+            result.append(item)
+    return result
+
+
+def scan_program_remnants(program):
+    files = find_file_candidates(program)
+    registry = registry_candidate_keys(program)
+    return files + registry
+
+
+def recursive_delete_registry_key(parent, subkey):
+    with winreg.OpenKey(parent, subkey, 0, winreg.KEY_READ | winreg.KEY_WRITE) as key:
+        while True:
+            try:
+                child = winreg.EnumKey(key, 0)
+                recursive_delete_registry_key(key, child)
+            except OSError:
+                break
+    winreg.DeleteKey(parent, subkey)
+
+
+def backup_and_delete_registry(item):
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", item["path"])[-100:]
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_file = BACKUP_DIR / f"{stamp}_{safe_name}.reg"
+    view_flag = "/reg:32" if item["view"] == getattr(winreg, "KEY_WOW64_32KEY", -1) else "/reg:64"
+    command = ["reg.exe", "export", item["path"], str(backup_file), "/y", view_flag]
+    result = subprocess.run(command, capture_output=True, text=True, shell=False)
+    if result.returncode != 0 or not backup_file.exists():
+        raise RuntimeError("No se pudo crear la copia .reg. La clave no fue eliminada.\n" + (result.stderr or result.stdout))
+    hive = winreg.HKEY_CURRENT_USER if item["hive"] == "HKCU" else winreg.HKEY_LOCAL_MACHINE
+    access = winreg.KEY_WRITE | item["view"]
+    # The stored subkey includes SOFTWARE\..., so open its immediate parent.
+    full = item["subkey"]
+    parent_path, leaf = full.rsplit("\\", 1)
+    with winreg.OpenKey(hive, parent_path, 0, access) as parent_key:
+        recursive_delete_registry_key(parent_key, leaf)
+    return backup_file
+
+
+class PurgeUninstaller(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title(f"{APP_NAME} {APP_VERSION} - Deep Cleaner")
+        self.geometry("1200x760")
+        self.minsize(980, 620)
+        self.programs = []
+        self.visible_programs = []
+        self.selected_program = None
+        self.scan_items = []
+        self.item_vars = []
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+        self.create_sidebar()
+        self.create_main_area()
+        self.load_programs_async()
+
+    def create_sidebar(self):
+        side = ctk.CTkFrame(self, width=215, corner_radius=0)
+        side.grid(row=0, column=0, sticky="nsew")
+        side.grid_propagate(False)
+        ctk.CTkLabel(side, text="♻ PURGE\nUNINSTALLER", font=ctk.CTkFont(size=23, weight="bold"), justify="left").pack(padx=18, pady=(28, 8), anchor="w")
+        ctk.CTkLabel(side, text=f"Versión {APP_VERSION} · Deep Cleaner", text_color="gray").pack(padx=20, anchor="w", pady=(0, 28))
+        self.nav_button(side, "▦  Programas", self.show_programs)
+        self.nav_button(side, "↻  Actualizar lista", self.load_programs_async)
+        ctk.CTkFrame(side, height=2, fg_color=("gray80", "gray25")).pack(fill="x", padx=18, pady=22)
+        ctk.CTkLabel(side, text="FUNCIONES", font=ctk.CTkFont(size=11, weight="bold"), text_color="gray").pack(padx=20, anchor="w", pady=(0, 8))
+        for line in ("✓ Detección de programas", "✓ Desinstalación original", "✓ Escaneo de restos", "✓ Limpieza manual", "✓ Copia del Registro"):
+            ctk.CTkLabel(side, text=line, anchor="w", text_color=("gray25", "gray75")).pack(fill="x", padx=20, pady=5)
+        ctk.CTkLabel(side, text="Revisa cada elemento antes\nde eliminarlo. No se limpia\nnada automáticamente.", text_color="#E5A93D", justify="left").pack(side="bottom", padx=20, pady=24, anchor="w")
+
+    def nav_button(self, parent, text, command):
+        ctk.CTkButton(parent, text=text, anchor="w", height=40, corner_radius=8, fg_color="transparent", text_color=("gray15", "gray90"), hover_color=("gray85", "gray25"), command=command).pack(fill="x", padx=12, pady=3)
+
+    def create_main_area(self):
+        main = ctk.CTkFrame(self, fg_color="transparent")
+        main.grid(row=0, column=1, sticky="nsew", padx=24, pady=20)
+        main.grid_columnconfigure(0, weight=3)
+        main.grid_columnconfigure(1, weight=2)
+        main.grid_rowconfigure(2, weight=1)
+        header = ctk.CTkFrame(main, fg_color="transparent")
+        header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 16))
+        header.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(header, text="Programas instalados", font=ctk.CTkFont(size=27, weight="bold")).grid(row=0, column=0, sticky="w")
+        self.count_label = ctk.CTkLabel(header, text="Cargando...", text_color="gray")
+        self.count_label.grid(row=1, column=0, sticky="w")
+        self.refresh_button = ctk.CTkButton(header, text="↻ Actualizar", width=120, command=self.load_programs_async)
+        self.refresh_button.grid(row=0, column=1, rowspan=2, padx=8)
+        self.search_entry = ctk.CTkEntry(main, placeholder_text="Buscar programa por nombre, editor o versión...", height=38)
+        self.search_entry.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 12))
+        self.search_entry.bind("<KeyRelease>", self.filter_programs)
+        self.list_frame = ctk.CTkScrollableFrame(main, label_text="Aplicaciones", corner_radius=12)
+        self.list_frame.grid(row=2, column=0, sticky="nsew", padx=(0, 12))
+        self.list_frame.grid_columnconfigure(0, weight=1)
+        self.details_frame = ctk.CTkFrame(main, corner_radius=12)
+        self.details_frame.grid(row=2, column=1, sticky="nsew")
+        self.details_frame.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(self.details_frame, text="Detalles del programa", font=ctk.CTkFont(size=18, weight="bold")).pack(anchor="w", padx=16, pady=(16, 10))
+        self.details_text = ctk.CTkTextbox(self.details_frame, wrap="word")
+        self.details_text.pack(fill="both", expand=True, padx=12, pady=5)
+        self.set_details("Selecciona un programa para ver sus detalles y buscar restos.")
+        self.uninstall_button = ctk.CTkButton(self.details_frame, text="Desinstalar programa", height=40, fg_color="#B83B43", hover_color="#922D34", state="disabled", command=self.uninstall_selected)
+        self.uninstall_button.pack(fill="x", padx=14, pady=(10, 6))
+        self.scan_button = ctk.CTkButton(self.details_frame, text="⌕  Buscar restos", height=40, state="disabled", command=self.scan_selected)
+        self.scan_button.pack(fill="x", padx=14, pady=(0, 14))
+        self.status_label = ctk.CTkLabel(main, text="Listo.", text_color="gray", anchor="w")
+        self.status_label.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+
+    def show_programs(self):
+        self.search_entry.focus_set()
+
+    def load_programs_async(self):
+        self.refresh_button.configure(state="disabled", text="Cargando...")
+        self.status_label.configure(text="Analizando el Registro de Windows...")
+        threading.Thread(target=self._load_worker, daemon=True).start()
+
+    def _load_worker(self):
+        result = get_installed_programs()
+        self.after(0, lambda: self.finish_loading(result))
+
+    def finish_loading(self, result):
+        self.programs = result
+        self.refresh_button.configure(state="normal", text="↻ Actualizar")
+        self.count_label.configure(text=f"{len(result)} programas detectados")
+        self.status_label.configure(text="Análisis completado.")
+        self.filter_programs()
+
+    def filter_programs(self, event=None):
+        q = self.search_entry.get().strip().casefold()
+        self.visible_programs = [p for p in self.programs if q in f"{p['name']} {p['publisher']} {p['version']}".casefold()]
+        for widget in self.list_frame.winfo_children():
+            widget.destroy()
+        self.selected_program = None
+        self.uninstall_button.configure(state="disabled")
+        self.scan_button.configure(state="disabled")
+        self.set_details("Selecciona un programa para ver sus detalles y buscar restos.")
+        if not self.visible_programs:
+            ctk.CTkLabel(self.list_frame, text="No se encontraron programas.", text_color="gray").grid(row=0, column=0, padx=15, pady=30)
+            return
+        for i, p in enumerate(self.visible_programs):
+            card = ctk.CTkFrame(self.list_frame, corner_radius=9)
+            card.grid(row=i, column=0, sticky="ew", padx=5, pady=5)
+            card.grid_columnconfigure(0, weight=1)
+            ctk.CTkLabel(card, text=p["name"], font=ctk.CTkFont(size=14, weight="bold"), anchor="w").grid(row=0, column=0, sticky="ew", padx=12, pady=(9, 2))
+            ctk.CTkLabel(card, text=f"{p['publisher']}  •  {p['version']}", text_color="gray", anchor="w").grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 9))
+            ctk.CTkButton(card, text="Seleccionar", width=95, height=30, command=lambda item=p: self.select_program(item)).grid(row=0, column=1, rowspan=2, padx=10)
+
+    def select_program(self, p):
+        self.selected_program = p
+        self.set_details(f"NOMBRE\n{p['name']}\n\nEDITOR\n{p['publisher']}\n\nVERSIÓN\n{p['version']}\n\nUBICACIÓN\n{p['location']}\n\nFECHA DE INSTALACIÓN\n{p['install_date']}\n\nÁMBITO\n{p['scope']}\n\nDESINSTALADOR\n{p['uninstall'] or 'No disponible'}\n\nPuedes buscar restos incluso después de desinstalar el programa.")
+        self.uninstall_button.configure(state="normal" if p["uninstall"].strip() else "disabled")
+        self.scan_button.configure(state="normal")
+        self.status_label.configure(text=f"Seleccionado: {p['name']}")
+
+    def set_details(self, text):
+        self.details_text.configure(state="normal")
+        self.details_text.delete("1.0", "end")
+        self.details_text.insert("1.0", text)
+        self.details_text.configure(state="disabled")
+
+    def uninstall_selected(self):
+        p = self.selected_program
+        if not p or not p["uninstall"].strip():
+            return
+        if not messagebox.askyesno("Confirmar desinstalación", f"¿Iniciar el desinstalador original de:\n\n{p['name']}?\n\nDespués podrás pulsar Buscar restos."):
+            return
+        try:
+            args = split_windows_command(p["uninstall"])
+            if not args:
+                raise ValueError("Comando vacío")
+            subprocess.Popen(args, shell=False)
+            messagebox.showinfo("Desinstalador iniciado", "Completa la desinstalación original. Después vuelve a PURGE UNINSTALLER y pulsa Buscar restos.")
+            self.status_label.configure(text=f"Desinstalador iniciado: {p['name']}")
+        except Exception as exc:
+            messagebox.showerror("Error", f"No se pudo iniciar el desinstalador:\n{exc}")
+
+    def scan_selected(self):
+        if not self.selected_program:
+            return
+        p = self.selected_program.copy()
+        self.scan_button.configure(state="disabled", text="Buscando...")
+        self.status_label.configure(text=f"Buscando posibles restos de {p['name']}...")
+        threading.Thread(target=self._scan_worker, args=(p,), daemon=True).start()
+
+    def _scan_worker(self, p):
+        try:
+            items = scan_program_remnants(p)
+            error = None
+        except Exception as exc:
+            items, error = [], str(exc)
+        self.after(0, lambda: self.finish_scan(p, items, error))
+
+    def finish_scan(self, p, items, error):
+        self.scan_button.configure(state="normal", text="⌕  Buscar restos")
+        if error:
+            messagebox.showerror("Error de análisis", error)
+            self.status_label.configure(text="El análisis no pudo completarse.")
+            return
+        self.status_label.configure(text=f"Análisis terminado: {len(items)} posibles restos.")
+        self.open_results_window(p, items)
+
+    def open_results_window(self, program, items):
+        win = ctk.CTkToplevel(self)
+        win.title(f"Restos encontrados - {program['name']}")
+        win.geometry("900x620")
+        win.minsize(720, 480)
+        win.transient(self)
+        win.grab_set()
+        win.grid_columnconfigure(0, weight=1)
+        win.grid_rowconfigure(1, weight=1)
+        ctk.CTkLabel(win, text="Resultados del análisis", font=ctk.CTkFont(size=23, weight="bold")).grid(row=0, column=0, sticky="w", padx=20, pady=(18, 4))
+        ctk.CTkLabel(win, text=f"Programa: {program['name']}  ·  {len(items)} posibles elementos", text_color="gray").grid(row=0, column=0, sticky="w", padx=20, pady=(48, 10))
+        body = ctk.CTkScrollableFrame(win, label_text="Marca solamente los elementos que reconoces como pertenecientes al programa")
+        body.grid(row=1, column=0, sticky="nsew", padx=18, pady=8)
+        body.grid_columnconfigure(0, weight=1)
+        vars_list = []
+        if not items:
+            ctk.CTkLabel(body, text="No se encontraron posibles restos en las ubicaciones analizadas.", text_color="gray").grid(row=0, column=0, padx=15, pady=30)
+        for i, item in enumerate(items):
+            var = ctk.BooleanVar(value=False)
+            vars_list.append((var, item))
+            row = ctk.CTkFrame(body, corner_radius=8)
+            row.grid(row=i, column=0, sticky="ew", padx=4, pady=4)
+            row.grid_columnconfigure(1, weight=1)
+            ctk.CTkCheckBox(row, text="", variable=var, width=25).grid(row=0, column=0, rowspan=2, padx=(10, 4), pady=8)
+            ctk.CTkLabel(row, text=f"{item['kind']}  ·  {format_size(item['size'])}", font=ctk.CTkFont(weight="bold"), anchor="w").grid(row=0, column=1, sticky="ew", padx=6, pady=(7, 0))
+            ctk.CTkLabel(row, text=item["path"], text_color="gray", anchor="w", wraplength=650, justify="left").grid(row=1, column=1, sticky="ew", padx=6, pady=(0, 7))
+        footer = ctk.CTkFrame(win, fg_color="transparent")
+        footer.grid(row=2, column=0, sticky="ew", padx=18, pady=14)
+        footer.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(footer, text="Los candidatos son sugerencias: revisa la ruta antes de seleccionarlos.", text_color="#E5A93D", wraplength=500).grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(footer, text="Eliminar seleccionados", fg_color="#B83B43", hover_color="#922D34", state="normal" if items else "disabled", command=lambda: self.delete_selected(win, program, vars_list)).grid(row=0, column=1, padx=(10, 0))
+
+    def delete_selected(self, win, program, vars_list):
+        selected = [item for var, item in vars_list if var.get()]
+        if not selected:
+            messagebox.showwarning("Nada seleccionado", "Marca al menos un elemento que hayas comprobado.", parent=win)
+            return
+        file_count = sum(not x["registry"] for x in selected)
+        reg_count = sum(x["registry"] for x in selected)
+        warning = (
+            f"Vas a procesar {len(selected)} elemento(s) de {program['name']}:\n"
+            f"- Archivos/carpetas: {file_count} (se enviarán a la Papelera)\n"
+            f"- Claves del Registro: {reg_count} (se exportarán antes de borrarlas)\n\n"
+            "Comprueba que no sean datos que quieras conservar. ¿Continuar?"
+        )
+        if not messagebox.askyesno("Confirmar limpieza", warning, icon="warning", parent=win):
+            return
+        deleted, failures, backups = 0, [], []
+        for item in selected:
+            try:
+                if item["registry"]:
+                    backup = backup_and_delete_registry(item)
+                    backups.append(str(backup))
+                else:
+                    target = Path(item["path"])
+                    # Recheck path existence immediately before moving to Recycle Bin.
+                    if not target.exists():
+                        raise FileNotFoundError("El elemento ya no existe.")
+                    send2trash(str(target))
+                deleted += 1
+            except Exception as exc:
+                failures.append(f"{item['path']}\n  {exc}")
+        summary = f"Elementos procesados correctamente: {deleted}\n"
+        if backups:
+            summary += f"\nCopias del Registro guardadas en:\n{BACKUP_DIR}\n"
+        if failures:
+            summary += "\nNo se pudieron procesar:\n" + "\n\n".join(failures[:8])
+        messagebox.showinfo("Resultado de limpieza", summary, parent=win)
+        if deleted:
+            win.destroy()
+            self.status_label.configure(text=f"Limpieza terminada: {deleted} elemento(s) procesados.")
+
+
+def main():
+    if sys.platform != "win32":
+        raise SystemExit("PURGE UNINSTALLER está diseñado para Windows.")
+    app = PurgeUninstaller()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
